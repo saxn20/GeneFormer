@@ -67,8 +67,6 @@ def get_embs(model,
     
     model_input_size = get_model_input_size(model)
     total_batch_length = len(filtered_input_data)
-    if ((total_batch_length-1)/forward_batch_size).is_integer():
-        forward_batch_size = forward_batch_size-1
     
     if summary_stat is None:
         embs_list = []
@@ -108,7 +106,8 @@ def get_embs(model,
                 embs_list += [mean_embs]
             elif summary_stat is not None:
                 # update tdigests with current batch for each emb dim
-                [embs_tdigests[i].batch_update(list(mean_embs[:,i])) for i in range(emb_dims)]
+                # note: tdigest batch update known to be slow so updating serially
+                [embs_tdigests[j].update(mean_embs[i,j].item()) for i in range(mean_embs.size(0)) for j in range(emb_dims)]
             
         del outputs
         del minibatch
