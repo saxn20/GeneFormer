@@ -14,7 +14,8 @@ Usage:
                        emb_label=["disease","cell_type"],
                        labels_to_plot=["disease","cell_type"],
                        forward_batch_size=100,
-                       nproc=16)
+                       nproc=16,
+                       summary_stat=None)
   embs = embex.extract_embs("path/to/model",
                             "path/to/input_data",
                             "path/to/output_directory",
@@ -33,6 +34,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pickle
+from tdigest import TDigest
 import scanpy as sc
 import seaborn as sns
 import torch
@@ -54,20 +56,30 @@ from .in_silico_perturber import downsample_and_sort, \
 
 logger = logging.getLogger(__name__)
 
-# average embedding position of goal cell states
+# extract embeddings
 def get_embs(model,
              filtered_input_data,
              emb_mode,
              layer_to_quant,
              pad_token_id,
-             forward_batch_size):
+             forward_batch_size,
+             summary_stat):
     
     model_input_size = get_model_input_size(model)
     total_batch_length = len(filtered_input_data)
     if ((total_batch_length-1)/forward_batch_size).is_integer():
         forward_batch_size = forward_batch_size-1
     
-    embs_list = []
+    if summary_stat is None:
+        embs_list = []
+    elif summary_stat is not None:
+        # test embedding extraction for example cell and extract # emb dims
+        example = filtered_input_data.select([i for i in range(1)])
+        example.set_format(type="torch")
+        emb_dims = test_emb(model, example["input_ids"], layer_to_quant)
+        # initiate tdigests for # of emb dims
+        embs_tdigests = [TDigest() for _ in range(emb_dims)]
+        
     for i in trange(0, total_batch_length, forward_batch_size):
         max_range = min(i+forward_batch_size, total_batch_length)
 
@@ -92,7 +104,11 @@ def get_embs(model,
         
         if emb_mode == "cell":
             mean_embs = mean_nonpadding_embs(embs_i, original_lens)
-            embs_list += [mean_embs]
+            if summary_stat is None:
+                embs_list += [mean_embs]
+            elif summary_stat is not None:
+                # update tdigests with current batch for each emb dim
+                [embs_tdigests[i].batch_update(list(mean_embs[:,i])) for i in range(emb_dims)]
             
         del outputs
         del minibatch
@@ -100,9 +116,27 @@ def get_embs(model,
         del embs_i
         del mean_embs
         torch.cuda.empty_cache()
-        
-    embs_stack = torch.cat(embs_list)
+    
+    if summary_stat is None:
+        embs_stack = torch.cat(embs_list)
+    # calculate summary stat embs from approximated tdigests
+    elif summary_stat is not None:
+        if summary_stat == "mean":
+            summary_emb_list = [embs_tdigests[i].trimmed_mean(0,100) for i in range(emb_dims)]
+        elif summary_stat == "median":
+            summary_emb_list = [embs_tdigests[i].percentile(50) for i in range(emb_dims)]
+        embs_stack = torch.tensor(summary_emb_list)
+    
     return embs_stack
+
+def test_emb(model, example, layer_to_quant):
+    with torch.no_grad():
+        outputs = model(
+            input_ids = example.to("cuda")
+        )
+
+    embs_test = outputs.hidden_states[layer_to_quant]
+    return embs_test.size()[2]
 
 def label_embs(embs, downsampled_data, emb_labels):
     embs_df = pd.DataFrame(embs.cpu())
@@ -131,7 +165,6 @@ def plot_umap(embs_df, emb_dims, label, output_file, kwargs_dict):
         
     sc.pl.umap(adata, color=label, save=output_file, **default_kwargs_dict)
 
-    
 def gen_heatmap_class_colors(labels, df):
     pal = sns.cubehelix_palette(len(Counter(labels).keys()), light=0.9, dark=0.1, hue=1, reverse=True, start=1, rot=-2)
     lut = dict(zip(map(str, Counter(labels).keys()), pal))
@@ -208,6 +241,7 @@ class EmbExtractor:
         "labels_to_plot": {None, list},
         "forward_batch_size": {int},
         "nproc": {int},
+        "summary_stat": {None, "mean", "median"},
     }
     def __init__(
         self,
@@ -222,6 +256,7 @@ class EmbExtractor:
         labels_to_plot=None,
         forward_batch_size=100,
         nproc=4,
+        summary_stat=None,
         token_dictionary_file=TOKEN_DICTIONARY_FILE,
     ):
         """
@@ -263,6 +298,9 @@ class EmbExtractor:
             Batch size for forward pass.
         nproc : int
             Number of CPU processes to use.
+        summary_stat : {None, "mean", "median"}
+            If not None, outputs only approximated mean or median embedding of input data.
+            Recommended if encountering memory constraints while generating goal embedding positions.
         token_dictionary_file : Path
             Path to pickle file containing token dictionary (Ensembl ID:token).
         """
@@ -278,6 +316,7 @@ class EmbExtractor:
         self.labels_to_plot = labels_to_plot
         self.forward_batch_size = forward_batch_size
         self.nproc = nproc
+        self.summary_stat = summary_stat
 
         self.validate_options()
 
@@ -353,14 +392,19 @@ class EmbExtractor:
                         self.emb_mode,
                         layer_to_quant,
                         self.pad_token_id,
-                        self.forward_batch_size)
-        embs_df = label_embs(embs, downsampled_data, self.emb_label)
+                        self.forward_batch_size,
+                        self.summary_stat)
         
+        if self.summary_stat is None:
+            embs_df = label_embs(embs, downsampled_data, self.emb_label)
+        elif self.summary_stat is not None:
+            embs_df = pd.DataFrame(embs.cpu()).T
+
         # save embeddings to output_path
         output_path = (Path(output_directory) / output_prefix).with_suffix(".csv")
         embs_df.to_csv(output_path)
-        
-        return embs_df
+
+        return embs_df        
     
     def plot_embs(self,
                   embs, 
