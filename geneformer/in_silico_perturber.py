@@ -14,6 +14,7 @@ Usage:
                           cell_emb_style="mean_pool",
                           filter_data={"cell_type":["cardiomyocyte"]},
                           cell_states_to_model={"state_key": "disease", "start_state": "dcm", "goal_state": "nf", "alt_states": ["hcm", "other1", "other2"]},
+                          state_embs_dict ={"nf": emb_nf, "hcm": emb_hcm, "dcm": emb_dcm, "other1": emb_other1, "other2": emb_other2},
                           max_ncells=None,
                           emb_layer=-1,
                           forward_batch_size=100,
@@ -246,65 +247,6 @@ def make_comparison_batch(original_emb_batch, indices_to_perturb, perturb_group)
         max_len = max(len_set)
         all_embs_list = [pad_2d_tensor(emb, None, max_len, 0) for emb in all_embs_list]
     return torch.stack(all_embs_list)
-
-# average embedding position of goal cell states
-def get_cell_state_avg_embs(model,
-                            filtered_input_data,
-                            cell_states_to_model,
-                            layer_to_quant,
-                            pad_token_id,
-                            forward_batch_size,
-                            num_proc):
-    
-    model_input_size = get_model_input_size(model)
-    possible_states = get_possible_states(cell_states_to_model)
-    state_embs_dict = dict()
-    for possible_state in possible_states:
-        state_embs_list = []
-        original_lens = []
-        
-        def filter_states(example):
-            state_key = cell_states_to_model["state_key"]
-            return example[state_key] in [possible_state]
-        filtered_input_data_state = filtered_input_data.filter(filter_states, num_proc=num_proc)
-        total_batch_length = len(filtered_input_data_state)
-        if ((total_batch_length-1)/forward_batch_size).is_integer():
-            forward_batch_size = forward_batch_size-1
-        max_len = max(filtered_input_data_state["length"])
-        for i in range(0, total_batch_length, forward_batch_size):
-            max_range = min(i+forward_batch_size, total_batch_length)
-                
-            state_minibatch = filtered_input_data_state.select([i for i in range(i, max_range)])
-            state_minibatch.set_format(type="torch")
-            
-            input_data_minibatch = state_minibatch["input_ids"]
-            original_lens += state_minibatch["length"]
-            input_data_minibatch = pad_tensor_list(input_data_minibatch, 
-                                                   max_len, 
-                                                   pad_token_id, 
-                                                   model_input_size)
-            attention_mask = gen_attention_mask(state_minibatch, max_len)
-
-            with torch.no_grad():
-                outputs = model(
-                    input_ids = input_data_minibatch.to("cuda"),
-                    attention_mask = attention_mask
-                )
-            
-            state_embs_i = outputs.hidden_states[layer_to_quant]
-            state_embs_list += [state_embs_i]
-            del outputs
-            del state_minibatch
-            del input_data_minibatch
-            del attention_mask
-            del state_embs_i
-            torch.cuda.empty_cache()
-
-        state_embs = torch.cat(state_embs_list)
-        avg_state_emb = mean_nonpadding_embs(state_embs, torch.Tensor(original_lens).to("cuda"))
-        avg_state_emb = torch.mean(avg_state_emb, dim=0, keepdim=True)
-        state_embs_dict[possible_state] = avg_state_emb
-    return state_embs_dict
 
 # quantify cosine similarity of perturbed vs original or alternate states
 def quant_cos_sims(model, 
@@ -574,7 +516,7 @@ def gen_attention_mask(minibatch_encoding, max_len = None):
                       if original_len <= max_len
                       else [1]*max_len
                       for original_len in original_lens]
-    return torch.tensor(attention_mask).to("cuda")
+    return torch.tensor(attention_mask, device="cuda")
 
 # get cell embeddings excluding padding
 def mean_nonpadding_embs(embs, original_lens):
@@ -602,6 +544,7 @@ class InSilicoPerturber:
         "cell_emb_style": {"mean_pool"},
         "filter_data": {None, dict},
         "cell_states_to_model": {None, dict},
+        "state_embs_dict ": {None, dict},
         "max_ncells": {None, int},
         "cell_inds_to_perturb": {"all", dict},
         "emb_layer": {-1, 0},
@@ -621,6 +564,7 @@ class InSilicoPerturber:
         cell_emb_style="mean_pool",
         filter_data=None,
         cell_states_to_model=None,
+        state_embs_dict =None,
         max_ncells=None,
         cell_inds_to_perturb="all",
         emb_layer=-1,
@@ -685,6 +629,15 @@ class InSilicoPerturber:
                           "start_state": "dcm",
                           "goal_state": "nf",
                           "alt_states": ["hcm", "other1", "other2"]}
+        state_embs_dict : None, dict
+            Embedding positions of each cell state to model shifts from/towards (e.g. mean or median).
+            Dictionary with keys specifying each possible cell state to model.
+            Values are target embedding positions as torch.tensor.
+            For example: {"nf": emb_nf, 
+                          "hcm": emb_hcm, 
+                          "dcm": emb_dcm, 
+                          "other1": emb_other1, 
+                          "other2": emb_other2}
         max_ncells : None, int
             Maximum number of cells to test.
             If None, will test all cells.
@@ -730,6 +683,7 @@ class InSilicoPerturber:
         self.cell_emb_style = cell_emb_style
         self.filter_data = filter_data
         self.cell_states_to_model = cell_states_to_model
+        self.state_embs_dict = state_embs_dict 
         self.max_ncells = max_ncells
         self.cell_inds_to_perturb = cell_inds_to_perturb
         self.emb_layer = emb_layer
@@ -944,7 +898,7 @@ class InSilicoPerturber:
         layer_to_quant = quant_layers(model)+self.emb_layer
         
         if self.cell_states_to_model is None:
-            state_embs_dict = None
+            self.state_embs_dict = None
         else:
             # confirm that all states are valid to prevent futile filtering
             state_name = self.cell_states_to_model["state_key"]
@@ -954,15 +908,9 @@ class InSilicoPerturber:
                     logger.error(
                         f"{value} is not present in the dataset's {state_name} attribute.")
                     raise
-            # get dictionary of average cell state embeddings for comparison
+            # downsample data and sort largest to smallest to encounter memory constraints earlier
             downsampled_data = downsample_and_sort(filtered_input_data, self.max_ncells)
-            state_embs_dict = get_cell_state_avg_embs(model,
-                                                      downsampled_data,
-                                                      self.cell_states_to_model,
-                                                      layer_to_quant,
-                                                      self.pad_token_id,
-                                                      self.forward_batch_size,
-                                                      self.nproc)
+
             # filter for start state cells
             start_state = self.cell_states_to_model["start_state"]
             def filter_for_origin(example):
@@ -973,7 +921,6 @@ class InSilicoPerturber:
         self.in_silico_perturb(model,
                               filtered_input_data,
                               layer_to_quant,
-                              state_embs_dict,
                               output_directory,
                               output_prefix)
     
@@ -982,7 +929,6 @@ class InSilicoPerturber:
                           model,
                           filtered_input_data,
                           layer_to_quant,
-                          state_embs_dict,
                           output_directory,
                           output_prefix):
         
@@ -1058,7 +1004,7 @@ class InSilicoPerturber:
                                            indices_to_perturb,
                                            self.perturb_group,
                                            self.cell_states_to_model,
-                                           state_embs_dict,
+                                           self.state_embs_dict,
                                            self.pad_token_id,
                                            model_input_size,
                                            self.nproc)
@@ -1133,7 +1079,7 @@ class InSilicoPerturber:
                                                        indices_to_perturb,
                                                        self.perturb_group,
                                                        self.cell_states_to_model,
-                                                       state_embs_dict,
+                                                       self.state_embs_dict,
                                                        self.pad_token_id,
                                                        model_input_size,
                                                        self.nproc)
@@ -1212,7 +1158,7 @@ class InSilicoPerturber:
                                                    indices_to_perturb,
                                                    self.perturb_group,
                                                    self.cell_states_to_model,
-                                                   state_embs_dict,
+                                                   self.state_embs_dict,
                                                    self.pad_token_id,
                                                    model_input_size,
                                                    self.nproc)
@@ -1234,7 +1180,7 @@ class InSilicoPerturber:
                                                          combo_indices_to_perturb,
                                                          self.perturb_group,
                                                          self.cell_states_to_model,
-                                                         state_embs_dict,
+                                                         self.state_embs_dict,
                                                          self.pad_token_id,
                                                          model_input_size,
                                                          self.nproc)
