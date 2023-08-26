@@ -578,17 +578,15 @@ def gen_attention_mask(minibatch_encoding, max_len = None):
 
 # get cell embeddings excluding padding
 def mean_nonpadding_embs(embs, original_lens):
-    # mask based on padding lengths
-    mask = torch.arange(embs.size(1)).unsqueeze(0).to("cuda") < original_lens.unsqueeze(1)
+    # create a mask tensor based on padding lengths
+    mask = torch.arange(embs.size(1), device=embs.device) < original_lens.unsqueeze(1)
 
-    # extend mask dimensions to match the embeddings tensor
-    mask = mask.unsqueeze(2).expand_as(embs)
+    # fill the masked positions in embs with zeros
+    masked_embs = embs.masked_fill(~mask.unsqueeze(2), 0.0)
 
-    # use the mask to zero out the embeddings in padded areas
-    masked_embs = embs * mask.float()
-
-    # sum and divide by the lengths to get the mean of non-padding embs
+    # compute the mean across the non-padding dimensions
     mean_embs = masked_embs.sum(1) / original_lens.view(-1, 1).float()
+
     return mean_embs
 
 class InSilicoPerturber:

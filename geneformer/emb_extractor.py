@@ -77,7 +77,7 @@ def get_embs(model,
         emb_dims = test_emb(model, example["input_ids"], layer_to_quant)
         # initiate tdigests for # of emb dims
         embs_tdigests = [TDigest() for _ in range(emb_dims)]
-        
+
     for i in trange(0, total_batch_length, forward_batch_size):
         max_range = min(i+forward_batch_size, total_batch_length)
 
@@ -91,13 +91,13 @@ def get_embs(model,
                                                max_len, 
                                                pad_token_id, 
                                                model_input_size)
-
+        
         with torch.no_grad():
             outputs = model(
                 input_ids = input_data_minibatch.to("cuda"),
                 attention_mask = gen_attention_mask(minibatch)
             )
-        
+
         embs_i = outputs.hidden_states[layer_to_quant]
         
         if emb_mode == "cell":
@@ -114,7 +114,7 @@ def get_embs(model,
         del input_data_minibatch
         del embs_i
         del mean_embs
-        torch.cuda.empty_cache()
+        torch.cuda.empty_cache()            
     
     if summary_stat is None:
         embs_stack = torch.cat(embs_list)
@@ -125,7 +125,7 @@ def get_embs(model,
         elif summary_stat == "median":
             summary_emb_list = [embs_tdigests[i].percentile(50) for i in range(emb_dims)]
         embs_stack = torch.tensor(summary_emb_list)
-    
+
     return embs_stack
 
 def test_emb(model, example, layer_to_quant):
@@ -300,6 +300,7 @@ class EmbExtractor:
         summary_stat : {None, "mean", "median"}
             If not None, outputs only approximated mean or median embedding of input data.
             Recommended if encountering memory constraints while generating goal embedding positions.
+            Slower but more memory-efficient.
         token_dictionary_file : Path
             Path to pickle file containing token dictionary (Ensembl ID:token).
         """
@@ -490,4 +491,3 @@ class EmbExtractor:
                 output_prefix_label = output_prefix + f"_heatmap_{label}"
                 output_file = (Path(output_directory) / output_prefix_label).with_suffix(".pdf")
                 plot_heatmap(embs, emb_dims, label, output_file, kwargs_dict)
-                
