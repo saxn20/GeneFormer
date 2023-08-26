@@ -58,6 +58,68 @@ def load_and_filter(filter_data, nproc, input_data_file):
     data_shuffled = data.shuffle(seed=42)
     return data_shuffled
 
+def filter_data_by_tokens(filtered_input_data, tokens, nproc):
+    def if_has_tokens(example):
+        return (len(set(example["input_ids"]).intersection(tokens))==len(tokens))
+    filtered_input_data = filtered_input_data.filter(if_has_tokens, num_proc=nproc)
+    return filtered_input_data
+
+def logging_filtered_data_len(filtered_input_data, filtered_tokens_categ):
+    if len(filtered_input_data) == 0:
+        logger.error(
+            f"No cells in dataset contain {filtered_tokens_categ}.")
+        raise
+    else:
+        logger.info(f"# cells with {filtered_tokens_categ}: {len(filtered_input_data)}")
+
+def filter_data_by_tokens_and_log(filtered_input_data, 
+                                  tokens, 
+                                  nproc, 
+                                  filtered_tokens_categ):
+    # filter for cells with anchor gene
+    filtered_input_data = filter_data_by_tokens(filtered_input_data, 
+                                                tokens, 
+                                                nproc)
+    # logging length of filtered data
+    logging_filtered_data_len(filtered_input_data, filtered_tokens_categ)
+    
+    return filtered_input_data
+
+def filter_data_by_start_state(filtered_input_data, 
+                               cell_states_to_model, 
+                               nproc):
+            
+    # confirm that start state is valid to prevent futile filtering
+    state_key = cell_states_to_model["state_key"]
+    state_values = filtered_input_data[state_key]
+    start_state = cell_states_to_model["start_state"]
+    for value in get_possible_states(cell_states_to_model):
+        if start_state not in state_values:
+            logger.error(
+                f"Start state {start_state} is not present " \ 
+                f"in the dataset's {state_key} attribute.")
+            raise
+
+    # filter for start state cells
+    def filter_for_origin(example):
+        return example[state_key] in [start_state]
+
+    filtered_input_data = filtered_input_data.filter(filter_for_origin, num_proc=nproc)
+    return filtered_input_data
+
+def slice_by_inds_to_perturb(filtered_input_data,
+                             cell_inds_to_perturb):
+    
+    if cell_inds_to_perturb["start"] >= len(filtered_input_data):
+        logger.error("cell_inds_to_perturb['start'] is larger than the filtered dataset.")
+        raise
+    if cell_inds_to_perturb["end"] > len(filtered_input_data):
+        logger.warning("cell_inds_to_perturb['end'] is larger than the filtered dataset. \
+                       Setting to the end of the filtered dataset.")
+        cell_inds_to_perturb["end"] = len(filtered_input_data)
+    filtered_input_data = filtered_input_data.select([i for i in range(cell_inds_to_perturb["start"], cell_inds_to_perturb["end"])])
+    return filtered_input_data
+
 # load model to GPU
 def load_model(model_type, num_classes, model_directory):
     if model_type == "Pretrained":
@@ -892,38 +954,307 @@ class InSilicoPerturber:
         output_prefix : str
             Prefix for output files
         """
-
-        filtered_input_data = load_and_filter(self.filter_data, self.nproc, input_data_file)
+        
+        ### format output path ###
+        output_path_prefix = f"{output_directory}in_silico_{self.perturb_type}_{output_prefix}_dict_1Kbatch"        
+        
+        ### load model and define parameters ###
         model = load_model(self.model_type, self.num_classes, model_directory)
+        model_input_size = get_model_input_size(model)
         layer_to_quant = quant_layers(model)+self.emb_layer
         
-        if self.cell_states_to_model is None:
-            self.state_embs_dict = None
-        else:
-            # confirm that all states are valid to prevent futile filtering
-            state_name = self.cell_states_to_model["state_key"]
-            state_values = filtered_input_data[state_name]
-            for value in get_possible_states(self.cell_states_to_model):
-                if value not in state_values:
-                    logger.error(
-                        f"{value} is not present in the dataset's {state_name} attribute.")
-                    raise
-            # downsample data and sort largest to smallest to encounter memory constraints earlier
-            downsampled_data = downsample_and_sort(filtered_input_data, self.max_ncells)
+        ### filter input data ### 
+        # general filtering of input data based on filter_data argument
+        filtered_input_data = load_and_filter(self.filter_data, self.nproc, input_data_file)
+        
+        # additional filtering of input data dependent on isp mode
+        if self.cell_states_to_model is not None:
+            # filter for cells with start_state and log result
+            filtered_input_data = filter_data_by_start_state(filtered_input_data, 
+                                                             self.cell_states_to_model, 
+                                                             self.nproc) 
 
-            # filter for start state cells
-            start_state = self.cell_states_to_model["start_state"]
-            def filter_for_origin(example):
-                return example[state_name] in [start_state]
+        if (self.tokens_to_perturb != "all") and (self.perturb_type != "overexpress"):
+            # filter for cells with tokens_to_perturb and log result
+            filtered_input_data = filter_data_by_tokens_and_log(filtered_input_data, 
+                                                                self.tokens_to_perturb, 
+                                                                self.nproc, 
+                                                                "gene(s) to perturb") 
             
-            filtered_input_data = filtered_input_data.filter(filter_for_origin, num_proc=self.nproc)
+        if self.anchor_token is not None:
+            # filter for cells with anchor gene and log result
+            filtered_input_data = filter_data_by_tokens_and_log(filtered_input_data, 
+                                                                self.anchor_gene, 
+                                                                self.nproc, 
+                                                                "anchor_gene")
             
-        self.in_silico_perturb(model,
-                              filtered_input_data,
-                              layer_to_quant,
-                              output_directory,
-                              output_prefix)
+        # downsample and sort largest to smallest to encounter memory constraints earlier
+        filtered_input_data = downsample_and_sort(filtered_input_data, self.max_ncells)
+        
+        
+        # slice dataset if cells_inds_to_perturb is not "all"
+        if self.cell_inds_to_perturb != "all":
+            filtered_input_data = slice_by_inds_to_perturb(filtered_input_data,
+                                                           self.cell_inds_to_perturb)
+            
+
+        
+        ####### separate functions for each isp mode #######
+        
+        ### perturb all genes individually ###
+        
+        # delete all genes, output cell embs
+        
+        # delete all genes, output cell and gene embs
+        
+        # delete all genes, model cell states
+        
+        # overexpress all genes, output cell embs
+        
+        # overexpress all genes, output cell and gene embs
+        
+        # overexpress all genes, model cell states
+        
+        
+        ### perturb single gene or group of genes ###
+
+        # delete gene(s), output cell embs
+        
+        # delete gene(s), output cell and gene embs
+        
+        # delete gene(s), model cell states
+        
+        # overexpress gene(s), output cell embs
+        
+        # overexpress gene(s), output cell and gene embs
+        
+        # overexpress gene(s), model cell states
+        
+        
+        ### perturb gene combinations ###
+        
+        # delete all genes with combo depth 1, output cell embs
+        
+        # delete all genes with combo depth 1, output cell and gene embs
+        
+        # overexpress all genes with combo depth 1, output cell embs
+        
+        # overexpress all genes with combo depth 1, output cell and gene embs
+
+        
+        ### perturb gene combinations with anchor ###
+
+        # delete anchor gene with combo depth 1, output cell embs
+
+        # delete anchor gene with combo depth 1, output cell and gene embs
+
+        # overexpress anchor gene with combo depth 1, output cell embs
+
+        # overexpress anchor gene with combo depth 1, output cell and gene embs
+        
+
+    ### perturb all genes individually ###
     
+    # delete all genes, output cell embs
+    def isp_del_all_output_cell(self,
+                                model,
+                                model_input_size,
+                                filtered_input_data,
+                                layer_to_quant,
+                                output_path_prefix):
+        return
+
+    # delete all genes, output cell and gene embs
+    def isp_del_all_output_cell_gene(self,
+                                     model,
+                                     model_input_size,
+                                     filtered_input_data,
+                                     layer_to_quant,
+                                     output_path_prefix):
+        return
+
+    # delete all genes, model cell states
+    def isp_del_all_model_states(self,
+                                 model,
+                                 model_input_size,
+                                 filtered_input_data,
+                                 layer_to_quant,
+                                 output_path_prefix):
+        return
+
+    # overexpress all genes, output cell embs
+    def isp_ovex_all_output_cell(self,
+                                 model,
+                                 model_input_size,
+                                 filtered_input_data,
+                                 layer_to_quant,
+                                 output_path_prefix):
+        return
+
+    # overexpress all genes, output cell and gene embs
+    def isp_ovex_all_output_cell_gene(self,
+                                      model,
+                                      model_input_size,
+                                      filtered_input_data,
+                                      layer_to_quant,
+                                      output_path_prefix):
+        return
+    
+    # overexpress all genes, model cell states
+    def isp_ovex_all_model_states(self,
+                                  model,
+                                  model_input_size,
+                                  filtered_input_data,
+                                  layer_to_quant,
+                                  output_path_prefix):
+        return
+
+    
+    ### perturb single gene or group of genes ###  
+    
+    # delete gene(s), output cell embs
+    def isp_del_set_output_cell(self,
+                                model,
+                                model_input_size,
+                                filtered_input_data,
+                                layer_to_quant,
+                                output_path_prefix):
+        return
+      
+    # delete gene(s), output cell and gene embs
+    def isp_del_set_output_cell_gene(self,
+                                     model,
+                                     model_input_size,
+                                     filtered_input_data,
+                                     layer_to_quant,
+                                     output_path_prefix):
+        return
+    
+    # delete gene(s), model cell states
+    def isp_del_set_model_states(self,
+                                 model,
+                                 model_input_size,
+                                 filtered_input_data,
+                                 layer_to_quant,
+                                 output_path_prefix):
+        return
+    
+    # overexpress gene(s), output cell embs
+    def isp_ovex_set_output_cell(self,
+                                 model,
+                                 model_input_size,
+                                 filtered_input_data,
+                                 layer_to_quant,
+                                 output_path_prefix):
+        return
+    
+    
+    # overexpress gene(s), output cell and gene embs
+    def isp_ovex_set_output_cell_gene(self,
+                                      model,
+                                      model_input_size,
+                                      filtered_input_data,
+                                      layer_to_quant,
+                                      output_path_prefix):
+        return
+    
+    
+    # overexpress gene(s), model cell states    
+    def isp_ovex_set_model_states(self,
+                                  model,
+                                  model_input_size,
+                                  filtered_input_data,
+                                  layer_to_quant,
+                                  output_path_prefix):
+        return
+       
+        
+    ### perturb gene combinations ###
+    
+    # delete all genes with combo depth 1, output cell embs
+    def isp_del_all_combo_output_cell(self,
+                                      model,
+                                      model_input_size,
+                                      filtered_input_data,
+                                      layer_to_quant,
+                                      output_path_prefix):
+        return
+
+    # delete all genes with combo depth 1, output cell and gene embs
+    def isp_del_all_combo_output_cell_gene(self,
+                                           model,
+                                           model_input_size,
+                                           filtered_input_data,
+                                           layer_to_quant,
+                                           output_path_prefix):
+        return
+    
+    # overexpress all genes with combo depth 1, output cell embs
+    def isp_ovex_all_combo_output_cell(self,
+                                       model,
+                                       model_input_size,
+                                       filtered_input_data,
+                                       layer_to_quant,
+                                       output_path_prefix):
+        return
+
+    # overexpress all genes with combo depth 1, output cell and gene embs
+    def isp_ovex_all_combo_output_cell_gene(self,
+                                            model,
+                                            model_input_size,
+                                            filtered_input_data,
+                                            layer_to_quant,
+                                            output_path_prefix):
+        return
+
+
+    ### perturb gene combinations with anchor ###
+
+    if 
+    # delete anchor gene with combo depth 1, output cell embs
+    def isp_del_anc_combo_output_cell(self,
+                                      model,
+                                      model_input_size,
+                                      filtered_input_data,
+                                      layer_to_quant,
+                                      output_path_prefix):
+        
+        return
+    
+    # delete anchor gene with combo depth 1, output cell and gene embs
+    def isp_del_anc_combo_output_cell_gene(self,
+                                           model,
+                                           model_input_size,
+                                           filtered_input_data,
+                                           layer_to_quant,
+                                           output_path_prefix):
+        
+        return
+    
+    # overexpress anchor gene with combo depth 1, output cell embs
+    def isp_ovex_anc_combo_output_cell(self,
+                                       model,
+                                       model_input_size,
+                                       filtered_input_data,
+                                       layer_to_quant,
+                                       output_path_prefix):
+        
+        return
+    
+    # overexpress anchor gene with combo depth 1, output cell and gene embs
+    def isp_ovex_anc_combo_output_cell_gene(self,
+                                            model,
+                                            model_input_size,
+                                            filtered_input_data,
+                                            layer_to_quant,
+                                            output_path_prefix):
+        
+       
+        return    
+    
+    
+    
+    ############ PRIOR VERSION ############
     # determine effect of perturbation on other genes
     def in_silico_perturb(self,
                           model,
@@ -932,45 +1263,45 @@ class InSilicoPerturber:
                           output_directory,
                           output_prefix):
         
-        output_path_prefix = f"{output_directory}in_silico_{self.perturb_type}_{output_prefix}_dict_1Kbatch"
-        model_input_size = get_model_input_size(model)
+        # output_path_prefix = f"{output_directory}in_silico_{self.perturb_type}_{output_prefix}_dict_1Kbatch"
+        # model_input_size = get_model_input_size(model)
         
         # filter dataset for cells that have tokens to be perturbed
-        if self.anchor_token is not None:
-            def if_has_tokens_to_perturb(example):
-                return (len(set(example["input_ids"]).intersection(self.anchor_token))==len(self.anchor_token))
-            filtered_input_data = filtered_input_data.filter(if_has_tokens_to_perturb, num_proc=self.nproc) 
-            if len(filtered_input_data) == 0:
-                logger.error(
-                        "No cells in dataset contain anchor gene.")
-                raise
-            else:
-                logger.info(f"# cells with anchor gene: {len(filtered_input_data)}")
+        # if self.anchor_token is not None:
+        #     def if_has_tokens_to_perturb(example):
+        #         return (len(set(example["input_ids"]).intersection(self.anchor_token))==len(self.anchor_token))
+        #     filtered_input_data = filtered_input_data.filter(if_has_tokens_to_perturb, num_proc=self.nproc) 
+        #     if len(filtered_input_data) == 0:
+        #         logger.error(
+        #                 "No cells in dataset contain anchor gene.")
+        #         raise
+        #     else:
+        #         logger.info(f"# cells with anchor gene: {len(filtered_input_data)}")
             
-        if (self.tokens_to_perturb != "all") and (self.perturb_type != "overexpress"):
-            # minimum # genes needed for perturbation test
-            min_genes = len(self.tokens_to_perturb)
+#         if (self.tokens_to_perturb != "all") and (self.perturb_type != "overexpress"):
+#             # minimum # genes needed for perturbation test
+#             min_genes = len(self.tokens_to_perturb)
             
-            def if_has_tokens_to_perturb(example):
-                return (len(set(example["input_ids"]).intersection(self.tokens_to_perturb))>=min_genes)
-            filtered_input_data = filtered_input_data.filter(if_has_tokens_to_perturb, num_proc=self.nproc)
-            if len(filtered_input_data) == 0:
-                logger.error(
-                        "No cells in dataset contain all genes to perturb as a group.")
-                raise
+#             def if_has_tokens_to_perturb(example):
+#                 return (len(set(example["input_ids"]).intersection(self.tokens_to_perturb))>=min_genes)
+#             filtered_input_data = filtered_input_data.filter(if_has_tokens_to_perturb, num_proc=self.nproc)
+#             if len(filtered_input_data) == 0:
+#                 logger.error(
+#                         "No cells in dataset contain all genes to perturb as a group.")
+#                 raise
             
         cos_sims_dict = defaultdict(list)
         pickle_batch = -1
-        filtered_input_data = downsample_and_sort(filtered_input_data, self.max_ncells)
-        if self.cell_inds_to_perturb != "all":
-            if self.cell_inds_to_perturb["start"] >= len(filtered_input_data):
-                logger.error("cell_inds_to_perturb['start'] is larger than the filtered dataset.")
-                raise
-            if self.cell_inds_to_perturb["end"] > len(filtered_input_data):
-                logger.warning("cell_inds_to_perturb['end'] is larger than the filtered dataset. \
-                               Setting to the end of the filtered dataset.")
-                self.cell_inds_to_perturb["end"] = len(filtered_input_data)
-            filtered_input_data = filtered_input_data.select([i for i in range(self.cell_inds_to_perturb["start"], self.cell_inds_to_perturb["end"])])
+        # filtered_input_data = downsample_and_sort(filtered_input_data, self.max_ncells)
+        # if self.cell_inds_to_perturb != "all":
+        #     if self.cell_inds_to_perturb["start"] >= len(filtered_input_data):
+        #         logger.error("cell_inds_to_perturb['start'] is larger than the filtered dataset.")
+        #         raise
+        #     if self.cell_inds_to_perturb["end"] > len(filtered_input_data):
+        #         logger.warning("cell_inds_to_perturb['end'] is larger than the filtered dataset. \
+        #                        Setting to the end of the filtered dataset.")
+        #         self.cell_inds_to_perturb["end"] = len(filtered_input_data)
+        #     filtered_input_data = filtered_input_data.select([i for i in range(self.cell_inds_to_perturb["start"], self.cell_inds_to_perturb["end"])])
         
         # make perturbation batch w/ single perturbation in multiple cells
         if self.perturb_group == True:
